@@ -1,0 +1,274 @@
+<!DOCTYPE html>
+<html lang="ar" dir="rtl">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, user-scalable=no, viewport-fit=cover">
+<title>ثعبان العداد</title>
+<link rel="manifest" href="manifest.json">
+<meta name="theme-color" content="#ACB607">
+<link rel="icon" href="icon-192.png">
+<link rel="apple-touch-icon" href="icon-192.png">
+<meta name="mobile-web-app-capable" content="yes">
+<meta name="apple-mobile-web-app-capable" content="yes">
+<style>
+  :root { --bg:#ACB607; --fg:#353802; --D:160px; --top:calc(env(safe-area-inset-top, 0px) + 2.2vh); }
+  * { box-sizing:border-box; }
+  html, body { margin:0; height:100%; overflow:hidden; background:var(--bg);
+    touch-action:none; overscroll-behavior:none;
+    user-select:none; -webkit-user-select:none; -webkit-touch-callout:none;
+    -webkit-tap-highlight-color:transparent;
+    font-family:system-ui,-apple-system,"Segoe UI",Roboto,Arial,sans-serif; }
+
+  #cv { position:fixed; inset:0; width:100%; height:100%; pointer-events:none; }
+
+  #badge { position:fixed; left:50%; top:var(--top); width:var(--D); height:var(--D);
+           margin-left:calc(var(--D) / -2); border-radius:50%; background:var(--fg); color:var(--bg);
+           display:flex; flex-direction:column; align-items:center; justify-content:center;
+           direction:ltr; pointer-events:none;
+           transition:transform .1s ease; }
+  #badge.bump { transform:scale(1.05); }
+  #badge span { font-size:calc(var(--D) * .33); font-weight:600; line-height:1;
+                font-variant-numeric:tabular-nums; }
+  #badge span.small { font-size:calc(var(--D) * .24); }
+  #bar { width:84%; height:calc(var(--D) * .036); margin:calc(var(--D) * .055) 0;
+         background:var(--bg); transform:rotate(-1.4deg); }
+
+  #toast { position:fixed; left:50%; bottom:calc(env(safe-area-inset-bottom, 0px) + 7vh);
+           transform:translateX(-50%); background:rgba(0,0,0,.45); color:#fff; padding:10px 20px;
+           border-radius:999px; font-size:16px; opacity:0; transition:opacity .3s; pointer-events:none; }
+  #toast.show { opacity:1; }
+</style>
+</head>
+<body>
+<canvas id="cv" aria-hidden="true"></canvas>
+<div id="badge"><span id="num">0</span><i id="bar"></i><span id="den">0</span></div>
+<div id="toast">تمت إعادة التعيين</div>
+
+<script>
+(() => {
+  /* الألوان ثابتة (مثل شاشة نوكيا) */
+  const BG = '#ACB607', FG = '#353802', GRID = '#BCC708';
+  const KEY = 'snake-counter-v1';
+  const root = document.documentElement;
+  const $ = id => document.getElementById(id);
+  const cv = $('cv'), ctx = cv.getContext('2d'), badge = $('badge');
+  const numEl = $('num'), denEl = $('den'), toast = $('toast');
+
+  /* ---------- الحفظ ---------- */
+  const load = () => { try { return JSON.parse(localStorage.getItem(KEY)) || {}; } catch (e) { return {}; } };
+  const save = () => { try { localStorage.setItem(KEY, JSON.stringify({ count, cycles })); } catch (e) {} };
+
+  const st = load();
+  let count  = Number.isFinite(st.count)  ? st.count  : 0;
+  let cycles = Number.isFinite(st.cycles) ? st.cycles : 0;
+  if (count >= 100) count = 0;
+  let celebrating = 0;
+
+  /* ---------- الثعبان (مربعات على شبكة، سُمكه 3 خلايا) ---------- */
+  const COLS = 27, THICK = 1;             // THICK=1 يعني 3 خلايا (-1..+1)
+  let cs = 20, rows = 50, cells = [], dirs = [], minLen = 6, total = 1, cellsDrawn = 0, cur = 0, target = 0, tau = .05, raf = 0, last = 0;
+  let blink = false, badgeRowG = 0;
+
+  function buildPath() {
+    const W = innerWidth, H = innerHeight;
+    cs = W / COLS;
+    rows = Math.ceil(H / cs);
+    const r = badge.getBoundingClientRect();
+    const badgeRow = Math.ceil(r.bottom / cs);
+    badgeRowG = badgeRow; const headY = badgeRow + 2;                      // مركز رأس الثعبان تحت الدائرة
+    const L = 2, R = COLS - 3, C = (COLS - 1) / 2;
+    const yLast = headY + 5;
+    const n = Math.max(2, Math.floor((rows - 3 - yLast) / 5) + 1);
+    // نقاط المسار من الذيل إلى الرأس
+    const way = [];
+    const laneY = j => yLast + 5 * j;
+    const startX = ((n - 1) % 2 === 1) ? R : L;       // الحارة السفلى: فردية تبدأ من اليمين
+    way.push([startX, rows + 2]);
+    for (let j = n - 1; j >= 1; j--) {
+      const fromRight = (j % 2 === 1);
+      way.push([fromRight ? R : L, laneY(j)]);
+      way.push([fromRight ? L : R, laneY(j)]);
+    }
+    way.push([L, laneY(0)]);
+    way.push([C, laneY(0)]);
+    way.push([C, headY]);
+    // تحويل النقاط إلى خلايا متتالية
+    cells = [[way[0][0], way[0][1]]];
+    for (let i = 1; i < way.length; i++) {
+      let [x, y] = cells[cells.length - 1];
+      const [tx, ty] = way[i];
+      while (x !== tx || y !== ty) {
+        if (x !== tx) x += Math.sign(tx - x); else y += Math.sign(ty - y);
+        cells.push([x, y]);
+      }
+    }
+    total = cells.length - 1;
+    // امتداد بعد الرأس لحساب مكان الأكلة
+    const [hx, hy] = cells[cells.length - 1], [px, py] = cells[cells.length - 2];
+    const dx = hx - px, dy = hy - py;
+    for (let k = 1; k <= 8; k++) cells.push([hx + dx * k, hy + dy * k]);
+    minLen = 6;
+    cur = target = lenFor(count);
+    sizeCanvas();
+    draw();
+  }
+  const lenFor = c => minLen + (total - minLen) * Math.min(c, 100) / 100;
+
+  function sizeCanvas() {
+    const dpr = window.devicePixelRatio || 1;
+    cv.width = Math.round(innerWidth * dpr);
+    cv.height = Math.round(innerHeight * dpr);
+    ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+  }
+
+  function draw() {
+    const W = innerWidth, H = innerHeight;
+    ctx.fillStyle = BG; ctx.fillRect(0, 0, W, H);
+    const len = Math.max(1, Math.min(total, Math.round(cur)));
+    const occ = new Set();
+    if (!blink) {
+      for (let i = 0; i <= len; i++) {
+        const [cx, cy] = cells[i];
+        for (let ox = -THICK; ox <= THICK; ox++)
+          for (let oy = -THICK; oy <= THICK; oy++) occ.add((cx + ox) * 1000 + (cy + oy));
+      }
+      const [hx, hy] = cells[len];
+      occ.delete(hx * 1000 + hy);                    // عين الرأس (الفتحة)
+    }
+    const g = Math.max(1, cs * 0.06);
+    ctx.fillStyle = FG;
+    const food = new Set();
+    if (cells[Math.min(cells.length - 1, len + 6)][1] - 1 > badgeRowG) {                           // الأكلة: 4 مربعات على شكل معيّن أمام الرأس
+      const [fx, fy] = cells[Math.min(cells.length - 1, len + 6)];
+      [[0, -1], [-1, 0], [1, 0], [0, 1]].forEach(([a, b]) => food.add((fx + a) * 1000 + (fy + b)));
+    }
+    const put = k => {
+      const x = Math.floor(k / 1000), y = k % 1000;
+      ctx.fillRect(x * cs + g, y * cs + g, cs - g * 2, cs - g * 2);
+    };
+    occ.forEach(put);
+    if (!blink) food.forEach(put);
+    // خطوط الشبكة فوق كل شيء
+    ctx.strokeStyle = GRID; ctx.lineWidth = 1; ctx.beginPath();
+    for (let x = 0; x <= COLS; x++) { const px = Math.round(x * cs) + .5; ctx.moveTo(px, 0); ctx.lineTo(px, H); }
+    for (let y = 0; y <= rows; y++) { const py = Math.round(y * cs) + .5; ctx.moveTo(0, py); ctx.lineTo(W, py); }
+    ctx.stroke();
+  }
+
+  function layout() {
+    const W = innerWidth, H = innerHeight;
+    if (!W || !H) return;
+    const D = Math.min(W * 0.4, H * 0.22);
+    root.style.setProperty('--D', D + 'px');
+    buildPath();
+  }
+
+  function step(t) {
+    const dt = Math.min(64, t - last) / 1000; last = t;
+    cur += (target - cur) * (1 - Math.exp(-dt / tau));
+    if (Math.abs(target - cur) < 0.3) { cur = target; raf = 0; draw(); return; }
+    draw(); raf = requestAnimationFrame(step);
+  }
+  function setTarget(speed) {
+    target = lenFor(count); tau = speed;
+    if (!raf) { last = performance.now(); raf = requestAnimationFrame(step); }
+  }
+
+  /* ---------- العرض ---------- */
+  function render() {
+    numEl.textContent = count;
+    denEl.textContent = cycles;
+    denEl.classList.toggle('small', String(cycles).length >= 4);
+  }
+  function bump() {
+    badge.classList.add('bump');
+    setTimeout(() => badge.classList.remove('bump'), 90);
+  }
+  let toastT;
+  function showToast(msg) {
+    toast.textContent = msg; toast.classList.add('show');
+    clearTimeout(toastT); toastT = setTimeout(() => toast.classList.remove('show'), 1500);
+  }
+  const vibrate = p => { try { navigator.vibrate && navigator.vibrate(p); } catch (e) {} };
+
+  /* ---------- الصوت ---------- */
+  let ac;
+  function unlock() {
+    try {
+      ac = ac || new (window.AudioContext || window.webkitAudioContext)();
+      if (ac.state === 'suspended') ac.resume();
+    } catch (e) {}
+  }
+  /* تنبيه صوتي عند الوصول إلى 100: نغمات قصيرة بأسلوب نوكيا */
+  function chime() {
+    unlock();
+    if (!ac) return;
+    const t0 = ac.currentTime + 0.03;
+    const notes = [[880, 0], [1108.7, .14], [1318.5, .28], [1760, .42], [0, .6], [880, .7], [1108.7, .84], [1318.5, .98], [1760, 1.12], [1760, 1.34]];
+    notes.forEach(([f, d], i) => {
+      if (!f) return;
+      const len = i === notes.length - 1 ? 0.5 : 0.11;
+      const o = ac.createOscillator(), g = ac.createGain();
+      o.type = 'square'; o.frequency.value = f;
+      const t = t0 + d;
+      g.gain.setValueAtTime(0.0001, t);
+      g.gain.exponentialRampToValueAtTime(0.28, t + 0.01);
+      g.gain.setValueAtTime(0.28, t + len - 0.03);
+      g.gain.exponentialRampToValueAtTime(0.0001, t + len);
+      o.connect(g); g.connect(ac.destination);
+      o.start(t); o.stop(t + len + 0.02);
+    });
+  }
+
+  /* ---------- المنطق ---------- */
+  function complete() {
+    cycles++; render();                       // يظهر 100 فوق و +1 تحت
+    chime(); vibrate([90, 70, 90]);           // تنبيه صوتي + اهتزاز
+    let n = 0;                                // وميض الثعبان (الألوان تبقى ثابتة)
+    const flash = setInterval(() => { blink = !blink; draw(); if (++n >= 6) { clearInterval(flash); blink = false; draw(); } }, 160);
+    celebrating = setTimeout(() => {          // الثعبان يرجع من الأول
+      celebrating = 0; count = 0; render(); setTarget(.28); save();
+    }, 1700);
+  }
+  function tap() {
+    if (celebrating) { clearTimeout(celebrating); celebrating = 0; count = 0; blink = false; }
+    count++; render(); bump(); setTarget(.07);
+    if (count >= 100) complete();
+    save();
+  }
+  function resetAll() {
+    clearTimeout(celebrating); celebrating = 0;
+    count = 0; cycles = 0; blink = false;
+    render(); setTarget(.2); save();
+    vibrate([40, 50, 40]); showToast('تمت إعادة التعيين');
+  }
+
+  /* ---------- اللمس: ضغطة في أي مكان = +1 ، ضغطة مطولة = إعادة ---------- */
+  const HOLD_MS = 2000;
+  let down = 0, hold = 0;
+  addEventListener('pointerdown', e => {
+    e.preventDefault(); unlock();
+    down++;
+    if (down === 1) hold = setTimeout(resetAll, HOLD_MS);
+    tap();
+  }, { passive: false });
+  const up = () => { down = Math.max(0, down - 1); if (!down) clearTimeout(hold); };
+  addEventListener('pointerup', up);
+  addEventListener('pointercancel', up);
+  const clearHold = () => { down = 0; clearTimeout(hold); };
+  addEventListener('blur', clearHold);
+  document.addEventListener('visibilitychange', clearHold);
+  addEventListener('contextmenu', e => e.preventDefault());
+  addEventListener('resize', layout);
+  addEventListener('orientationchange', () => setTimeout(layout, 200));
+
+  /* ---------- البداية ---------- */
+  render();
+  layout();
+  if ('serviceWorker' in navigator && location.protocol.indexOf('http') === 0) {
+    addEventListener('load', () => navigator.serviceWorker.register('sw.js').catch(() => {}));
+  }
+})();
+</script>
+</body>
+</html>
